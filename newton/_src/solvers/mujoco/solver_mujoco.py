@@ -48,7 +48,7 @@ from .kernels import (
     apply_mjc_qfrc_kernel,
     convert_body_xforms_to_warp_kernel,
     convert_mj_coords_to_warp_kernel,
-    convert_mjw_contact_to_warp_kernel,
+    convert_mjw_contacts_to_newton_kernel,
     convert_newton_contacts_to_mjwarp_kernel,
     convert_rigid_forces_from_mj_kernel,
     convert_solref,
@@ -1652,32 +1652,41 @@ class SolverMuJoCo(SolverBase):
         return shape_color
 
     @override
-    def update_contacts(self, contacts: Contacts) -> None:
+    def contacts(self) -> Contacts:
+        if self.use_mujoco_cpu:
+            raise NotImplementedError()
+        else:
+            rigid_contact_max = self.mjw_data.naconmax
+
+        return Contacts(
+            rigid_contact_max,
+            0,
+            requires_grad=False,
+            device=self.model.device,
+        )
+
+    @override
+    def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
+        """Update `contacts` from MuJoCo contacts when running with ``use_mujoco_contacts``."""
+        if self.use_mujoco_cpu:
+            raise NotImplementedError()
+        else:
+            rigid_contact_max = self.mjw_data.naconmax
+
         # TODO: ensure that class invariants are preserved
         # TODO: fill actual contact arrays instead of creating new ones
         mj_data = self.mjw_data
-        naconmax = mj_data.naconmax
         mj_contact = mj_data.contact
 
-        contacts.rigid_contact_max = naconmax
-        contacts.rigid_contact_count = mj_data.nacon
-        contacts.position = mj_contact.pos
-        contacts.separation = mj_contact.dist
-
-        if not hasattr(contacts, "pair"):
-            contacts.pair = wp.zeros(naconmax, dtype=wp.vec2i, device=self.model.device)
-
-        if not hasattr(contacts, "normal"):
-            contacts.normal = wp.zeros(naconmax, dtype=wp.vec3f, device=self.model.device)
-
-        if not hasattr(contacts, "force"):
-            contacts.force = wp.zeros(naconmax, dtype=wp.float32, device=self.model.device)
+        if mj_data.naconmax > rigid_contact_max:
+            raise ValueError("data.naconmax exceeds contacts.rigid_contact_max!")
 
         wp.launch(
-            convert_mjw_contact_to_warp_kernel,
+            convert_mjw_contacts_to_newton_kernel,
             dim=mj_data.naconmax,
             inputs=[
                 self.mjc_geom_to_newton_shape,
+                self.mjc_body_to_newton,
                 self.mjw_model.opt.cone == int(self._mujoco.mjtCone.mjCONE_PYRAMIDAL),
                 mj_data.nacon,
                 mj_contact.frame,
@@ -1688,9 +1697,13 @@ class SolverMuJoCo(SolverBase):
                 mj_data.efc.force,
             ],
             outputs=[
-                contacts.pair,
-                contacts.normal,
-                contacts.force,
+                contacts.rigid_contact_count,
+                contacts.rigid_contact_shape0,
+                contacts.rigid_contact_shape1,
+                contacts.rigid_contact_point0,
+                contacts.rigid_contact_point1,
+                contacts.rigid_contact_normal,
+                state.contact_f if state else None,
             ],
             device=self.model.device,
         )

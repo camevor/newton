@@ -33,6 +33,7 @@ class State:
         (
             "body_qdd",
             "body_parent_f",
+            "contact_f",
         )
     )
     """
@@ -112,6 +113,14 @@ class State:
 
         self.joint_qd: wp.array | None = None
         """Generalized joint velocity coordinates, shape (joint_dof_count,), dtype float."""
+
+        self.contact_f: wp.array | None = None
+        """Contact forces (spatial), shape (rigid_contact_max + soft_contact_max,), dtype :class:`spatial_vector`.
+        First three entries: linear forces; last three: torques.
+        When both rigid and soft contacts are present, soft contact forces follow rigid contact forces.
+
+        This is an extended state attribute; see :ref:`extended_state_attributes` for more information.
+        """
 
     def clear_forces(self) -> None:
         """

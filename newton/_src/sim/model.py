@@ -549,13 +549,15 @@ class Model:
         self.attribute_frequency["shape_scale"] = ModelAttributeFrequency.SHAPE
         self.attribute_frequency["shape_filter"] = ModelAttributeFrequency.SHAPE
 
-    def state(self, requires_grad: bool | None = None) -> State:
+    def state(self, contacts: Contacts = None, requires_grad: bool | None = None) -> State:
         """
         Create and return a new :class:`State` object for this model.
 
         The returned state is initialized with the initial configuration from the model description.
 
         Args:
+            contacts (Contacts, optional): Contacts object for sizing of contact-frequency extended state attributes.
+            Used and mandatory only when extended state attributes with contact frequency have been requested, e.g. by ``SensorContact``.
             requires_grad (bool, optional): Whether the state variables should have `requires_grad` enabled.
                 If None, uses the model's :attr:`requires_grad` setting.
 
@@ -591,6 +593,16 @@ class Model:
 
         if "body_parent_f" in requested:
             s.body_parent_f = wp.zeros_like(self.body_qd, requires_grad=requires_grad)
+
+        if "contact_f" in requested:
+            if contacts is None:
+                raise ValueError(
+                    "Model.state() requires a Contacts object to initialize the extended state attribute contact_f."
+                )
+            n_contacts_max = contacts.rigid_contact_max + contacts.soft_contact_max
+            s.contact_f = wp.zeros(
+                n_contacts_max, dtype=wp.spatial_vector, device=self.device, requires_grad=requires_grad
+            )
 
         # attach custom attributes with assignment==STATE
         self._add_custom_attributes(s, ModelAttributeAssignment.STATE, requires_grad=requires_grad)
@@ -675,7 +687,7 @@ class Model:
 
     def contacts(
         self: Model,
-        collision_pipeline: CollisionPipeline | None = None,
+        collision_pipeline: CollisionPipeline | SolverBase | None = None,
         rigid_contact_max_per_pair: int | None = None,
         soft_contact_max: int | None = None,
         soft_contact_margin: float = 0.01,
@@ -690,8 +702,9 @@ class Model:
         populate the contacts with actual collision data.
 
         Args:
-            collision_pipeline (CollisionPipeline, optional): Collision pipeline to use.
+            collision_pipeline (CollisionPipeline or SolverBase, optional): Collision pipeline to use.
                 If not provided, one will be created and cached on first call.
+                Solvers implementing their own contact generation (i.e. implementing ``contacts()``) are also accepted.
             rigid_contact_max_per_pair (int, optional): Maximum number of rigid contacts per shape pair.
                 If None, a kernel is launched to count the number of possible contacts.
             soft_contact_max (int, optional): Maximum number of soft contacts.
@@ -709,32 +722,34 @@ class Model:
             it defaults to ``builder.rigid_contact_margin``. To adjust contact margins, set them before calling
             :meth:`ModelBuilder.finalize`.
         """
+        from ..solvers import SolverBase  # noqa: PLC0415
         from .collide import CollisionPipeline  # noqa: PLC0415
 
         if requires_grad is None:
             requires_grad = self.requires_grad
 
-        if collision_pipeline is not None:
-            self._collision_pipeline = collision_pipeline
-            # TODO: raise if params passed that are incompatible with collision pipeline
-
-            # update any additional parameters
-            self._collision_pipeline.soft_contact_margin = soft_contact_margin
-            self._collision_pipeline.edge_sdf_iter = edge_sdf_iter
-        elif self._collision_pipeline is None:
-            self._collision_pipeline = CollisionPipeline.from_model(
-                model=self,
-                rigid_contact_max_per_pair=rigid_contact_max_per_pair,
-                soft_contact_max=soft_contact_max,
-                soft_contact_margin=soft_contact_margin,
-                edge_sdf_iter=edge_sdf_iter,
-                requires_grad=requires_grad,
-            )
+        if isinstance(collision_pipeline, SolverBase):
+            contacts = collision_pipeline.contacts()
         else:
-            # TODO: raise if params passed that are incompatible with collision pipeline
-            pass
+            if collision_pipeline is not None:
+                self._collision_pipeline = collision_pipeline
+                # update any additional parameters
+                self._collision_pipeline.soft_contact_margin = soft_contact_margin
+                self._collision_pipeline.edge_sdf_iter = edge_sdf_iter
+            elif self._collision_pipeline is None:
+                self._collision_pipeline = CollisionPipeline.from_model(
+                    model=self,
+                    rigid_contact_max_per_pair=rigid_contact_max_per_pair,
+                    soft_contact_max=soft_contact_max,
+                    soft_contact_margin=soft_contact_margin,
+                    edge_sdf_iter=edge_sdf_iter,
+                    requires_grad=requires_grad,
+                )
+                collision_pipeline = self._collision_pipeline
+            else:
+                collision_pipeline = self._collision_pipeline
 
-        contacts = self._collision_pipeline.contacts(self)
+            contacts = collision_pipeline.contacts(self)
         # attach custom attributes with assignment==CONTACT
         self._add_custom_attributes(contacts, ModelAttributeAssignment.CONTACT, requires_grad=requires_grad)
         return contacts

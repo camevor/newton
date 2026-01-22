@@ -301,6 +301,18 @@ class SolverBase:
         """
         pass
 
+    def contacts(self) -> Contacts:
+        """
+        Allocate and return a :class:`Contacts` object for the given solver.
+
+        This method is only implemented by solvers that implement their own contact generation.
+
+        Returns:
+            Contacts: A newly allocated contacts buffer sized for this solver's internal
+                contact generation pipeline.
+        """
+        raise NotImplementedError()
+
     def update_contacts(self, contacts: Contacts) -> None:
         """
         Update a Contacts object with forces from the solver state. Where the solver state contains

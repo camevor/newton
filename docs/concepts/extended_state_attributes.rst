@@ -44,6 +44,8 @@ The following optional State attributes can currently be requested and allocated
      - Rigid-body spatial accelerations (used by :class:`~newton.sensors.SensorIMU`)
    * - :attr:`body_parent_f <newton.State.body_parent_f>`
      - Rigid-body parent interaction wrenches
+   * - :attr:`contact_f <newton.State.contact_f>`
+     - Contact spatial forces (used by :class:`~newton.sensors.SensorContact`)
 
 Notes
 -----
