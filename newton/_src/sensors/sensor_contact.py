@@ -304,12 +304,6 @@ class SensorContact:
             c_shapes = [self.ObjectType.TOTAL]
             c_bodies = []
 
-        contact_pairs = (
-            set(map(tuple, model.shape_contact_pairs.list()))
-            if getattr(model, "shape_contact_pairs", None) is not None
-            else None
-        )
-
         TOTAL = self.ObjectType.TOTAL
         wc = model.world_count
         shape_ws = model.shape_world_start.list()
@@ -332,12 +326,20 @@ class SensorContact:
         c_body_b, c_body_g = bucket(c_bodies, body_ws)
         c_shape_b, c_shape_g = bucket(c_shapes, shape_ws)
 
+        contact_pairs = (
+            set(map(tuple, model.shape_contact_pairs.numpy()))
+            if getattr(model, "shape_contact_pairs", None) is not None
+            else None
+        )
+
         per_world_results = []
         for w in range(wc):
             wb = ([TOTAL] if TOTAL in c_bodies else []) + c_body_g + c_body_b[w]
             wsh = ([TOTAL] if TOTAL in c_shapes else []) + c_shape_g + c_shape_b[w]
             per_world_results.append(
-                self._assemble_sensor_mappings(s_body_b[w], s_shape_b[w], wb, wsh, model.body_shapes, contact_pairs)
+                self._assemble_sensor_mappings(
+                    s_body_b[w], s_shape_b[w], wb, wsh, model.body_shapes, contact_pairs
+                )
             )
 
         max_r = max((r[2] for r in per_world_results), default=0)
