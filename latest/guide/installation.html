@@ -168,15 +168,15 @@
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="key-concepts.html">
-    Key Concepts
+  <a class="nav-link nav-internal" href="tutorials.html">
+    Tutorials
   </a>
 </li>
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="tutorials.html">
-    Tutorials
+  <a class="nav-link nav-internal" href="development.html">
+    Development
   </a>
 </li>
 
@@ -188,13 +188,6 @@
                 </button>
                 <ul id="pst-nav-more-links" class="dropdown-menu">
                     
-<li class=" ">
-  <a class="nav-link dropdown-item nav-internal" href="development.html">
-    Development
-  </a>
-</li>
-
-
 <li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="../concepts/worlds.html">
     Worlds
@@ -480,13 +473,6 @@
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="key-concepts.html">
-    Key Concepts
-  </a>
-</li>
-
-
-<li class="nav-item ">
   <a class="nav-link nav-internal" href="tutorials.html">
     Tutorials
   </a>
@@ -719,7 +705,6 @@
 <li class="toctree-l1"><a class="reference internal" href="overview.html">Overview</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Installation</a></li>
 <li class="toctree-l1"><a class="reference internal" href="visualization.html">Visualization</a></li>
-<li class="toctree-l1"><a class="reference internal" href="key-concepts.html">Key Concepts</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tutorials.html">Tutorials</a></li>
 <li class="toctree-l1"><a class="reference internal" href="development.html">Development</a></li>
 </ul>
@@ -997,9 +982,9 @@ Python version, or follow the <a class="reference internal" href="development.ht
 </div>
 <p>Run an example that runs RL policy inference. Choose the extra matching your
 NVIDIA driver’s CUDA support (<code class="docutils literal notranslate"><span class="pre">torch-cu12</span></code> for CUDA 12.x, <code class="docutils literal notranslate"><span class="pre">torch-cu13</span></code> for
-CUDA 13.x); run <code class="docutils literal notranslate"><span class="pre">nvidia-smi</span></code> to check the supported CUDA version (shown in
-the top-right corner of the output):</p>
-<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">pip install &quot;newton[torch-cu12]&quot;</span>
+CUDA 13.x) and the corresponding pytorch wheel (e.g, <code class="docutils literal notranslate"><span class="pre">128</span></code> for CUDA 12.8); run <code class="docutils literal notranslate"><span class="pre">nvidia-smi</span></code>
+to check the supported CUDA version (shown in the top-right corner of the output):</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">pip install newton[torch-cu12] --extra-index-url https://download.pytorch.org/whl/cu128</span>
 <span class="go">python -m newton.examples robot_anymal_c_walk</span>
 </pre></div>
 </div>
@@ -1056,7 +1041,7 @@ robot template across many worlds and step them all simultaneously on the GPU:</
 <span class="n">solver</span> <span class="o">=</span> <span class="n">newton</span><span class="o">.</span><span class="n">solvers</span><span class="o">.</span><span class="n">SolverMuJoCo</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
 </pre></div>
 </div>
-<p>See the <a class="reference internal" href="key-concepts.html"><span class="doc">Key Concepts</span></a> guide and <a class="reference internal" href="../integrations/isaac-lab.html"><span class="doc">Isaac Lab Integration</span></a>
+<p>See the <a class="reference internal" href="overview.html"><span class="doc">Newton Physics Documentation</span></a> guide and <a class="reference internal" href="../integrations/isaac-lab.html"><span class="doc">Isaac Lab Integration</span></a>
 for more details.</p>
 </section>
 </section>
