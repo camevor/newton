@@ -493,6 +493,134 @@ class TestModelMesh(unittest.TestCase):
         self.assertIn((shape0, shape2), model.shape_collision_filter_pairs)
         self.assertIn((shape1, shape2), model.shape_collision_filter_pairs)
 
+    def test_collision_filter_fixed_to_world(self):
+        """Bodies fixed to world via add_joint_fixed(parent=-1) should auto-filter
+        their shapes against world-static shapes regardless of construction order
+        (issue #2201)."""
+
+        def joint_first():
+            b = ModelBuilder()
+            body = b.add_body()
+            b.add_joint_fixed(parent=-1, child=body)
+            mesh_shape = b.add_shape_sphere(body=body, radius=0.5)
+            ground_shape = b.add_ground_plane()
+            return b, mesh_shape, ground_shape
+
+        def world_shape_first():
+            b = ModelBuilder()
+            ground_shape = b.add_ground_plane()
+            body = b.add_body()
+            b.add_joint_fixed(parent=-1, child=body)
+            mesh_shape = b.add_shape_sphere(body=body, radius=0.5)
+            return b, mesh_shape, ground_shape
+
+        def body_shape_first():
+            b = ModelBuilder()
+            body = b.add_body()
+            mesh_shape = b.add_shape_sphere(body=body, radius=0.5)
+            b.add_joint_fixed(parent=-1, child=body)
+            ground_shape = b.add_ground_plane()
+            return b, mesh_shape, ground_shape
+
+        for case_name, build in (
+            ("joint before shapes", joint_first),
+            ("world shape before joint", world_shape_first),
+            ("body shape before joint", body_shape_first),
+        ):
+            with self.subTest(case=case_name):
+                builder, mesh_shape, ground_shape = build()
+                self.assertIn(
+                    (min(mesh_shape, ground_shape), max(mesh_shape, ground_shape)),
+                    set(builder.shape_collision_filter_pairs),
+                )
+
+    def test_collision_filter_floating_base_not_filtered(self):
+        """Floating-base bodies (FREE joint to world) must NOT be filtered against
+        world shapes — they need to be able to land on the ground."""
+
+        def normalize_pair(a, b):
+            return (min(a, b), max(a, b))
+
+        builder = ModelBuilder()
+        body = builder.add_body()
+        builder.add_joint_free(parent=-1, child=body)
+        base_shape = builder.add_shape_sphere(body=body, radius=0.5)
+        ground_shape = builder.add_ground_plane()
+        self.assertNotIn(
+            normalize_pair(base_shape, ground_shape),
+            set(builder.shape_collision_filter_pairs),
+        )
+
+    def test_collision_filter_revolute_to_world_default(self):
+        """A revolute (non-fixed) joint to world does NOT auto-filter child shapes
+        against world shapes — the child can swing through world geometry."""
+
+        def normalize_pair(a, b):
+            return (min(a, b), max(a, b))
+
+        builder = ModelBuilder()
+        body = builder.add_body()
+        builder.add_joint_revolute(parent=-1, child=body, axis=newton.Axis.Z)
+        body_shape = builder.add_shape_sphere(body=body, radius=0.5)
+        ground_shape = builder.add_ground_plane()
+        self.assertNotIn(
+            normalize_pair(body_shape, ground_shape),
+            set(builder.shape_collision_filter_pairs),
+        )
+
+    def test_collision_filter_revolute_to_world_explicit(self):
+        """Explicit collision_filter_parent=True is honored even for a non-fixed
+        joint to world (overrides the smart default) when shapes exist at
+        joint-creation time."""
+
+        def normalize_pair(a, b):
+            return (min(a, b), max(a, b))
+
+        builder = ModelBuilder()
+        body = builder.add_body()
+        body_shape = builder.add_shape_sphere(body=body, radius=0.5)
+        ground_shape = builder.add_ground_plane()
+        builder.add_joint_revolute(parent=-1, child=body, axis=newton.Axis.Z, collision_filter_parent=True)
+        self.assertIn(
+            normalize_pair(body_shape, ground_shape),
+            set(builder.shape_collision_filter_pairs),
+        )
+
+    def test_collision_filter_free_with_real_parent_default_filtered(self):
+        """A free joint between two real bodies auto-filters parent/child shape pairs by
+        default, matching the legacy behavior for joints between real bodies."""
+
+        def normalize_pair(a, b):
+            return (min(a, b), max(a, b))
+
+        builder = ModelBuilder()
+        parent = builder.add_body()
+        child = builder.add_body()
+        parent_shape = builder.add_shape_sphere(body=parent, radius=0.5)
+        child_shape = builder.add_shape_sphere(body=child, radius=0.5)
+        builder.add_joint_free(parent=parent, child=child)
+        self.assertIn(
+            normalize_pair(parent_shape, child_shape),
+            set(builder.shape_collision_filter_pairs),
+        )
+
+    def test_collision_filter_fixed_to_world_opt_out(self):
+        """collision_filter_parent=False on the joint suppresses the auto-filter
+        when shapes already exist on both sides at joint-creation time."""
+
+        def normalize_pair(a, b):
+            return (min(a, b), max(a, b))
+
+        builder = ModelBuilder()
+        body = builder.add_body()
+        mesh_shape = builder.add_shape_sphere(body=body, radius=0.5)
+        ground_shape = builder.add_ground_plane()
+        builder.add_joint_fixed(parent=-1, child=body, collision_filter_parent=False)
+        self.assertNotIn(
+            normalize_pair(mesh_shape, ground_shape),
+            set(builder.shape_collision_filter_pairs),
+        )
+
     def test_validate_structure_invalid_shape_body(self):
         """Test that _validate_structure catches invalid shape_body references."""
         builder = ModelBuilder()
