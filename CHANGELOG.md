@@ -43,6 +43,7 @@
 - Fix `example_softbody_gift` emitting spurious non-manifold edge warnings caused by mismatched 5-tet diagonals across adjacent cubes in the soft body mesh.
 - Fix `basic_conveyor` example emitting a spurious inertia validation warning at finalize.
 - Fix `SolverMuJoCo` generated MuJoCo joint names for multi-axis D6 joints to avoid duplicate names
+- Fix `SolverMuJoCo` ball-joint conversion so that `joint_q` and `joint_qd` on a joint with non-identity `child_xform` rotation produce matching body transforms and angular velocities across `newton.eval_fk`, `mujoco.mj_kinematics`, and `mujoco_warp.kinematics`. The previous xyzw-to-wxyz layout swap did not bridge Newton's anchor-frame quaternion to MuJoCo's body-frame `qpos`/`qvel`; the bridge kernels now conjugate by `joint_X_c.q`.
 - Fix USD import of revolute and D6-angular joint `limit_ke` / `limit_kd` from `mjc:solreflimit` being over-scaled by ~57x
 - Fix USD import losing authored negative scales on shape and parent xforms, so mirrored primitives and meshes are now imported with the correct signed scale
 
