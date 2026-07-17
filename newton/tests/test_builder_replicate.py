@@ -12,7 +12,9 @@ from newton.actuators import ControllerPD
 from newton.utils import compute_world_offsets
 
 
-class TestModelBuilderReplicate(unittest.TestCase):
+class BuilderMergeTestCase(unittest.TestCase):
+    """Shared fixtures and state assertions for builder-merge tests."""
+
     @staticmethod
     def _make_source() -> ModelBuilder:
         builder = ModelBuilder()
@@ -111,8 +113,10 @@ class TestModelBuilderReplicate(unittest.TestCase):
         builder.end_world()
         return builder
 
-    def assert_builder_merge_state_equal(self, expected: ModelBuilder, actual: ModelBuilder) -> None:
-        manually_verified = ("_shape_collision_filter_pairs", "actuator_entries", "custom_attributes")
+    def assert_builder_merge_state_equal(
+        self, expected: ModelBuilder, actual: ModelBuilder, ignore: tuple[str, ...] = ()
+    ) -> None:
+        manually_verified = ("_shape_collision_filter_pairs", "actuator_entries", "custom_attributes", *ignore)
         for name in sorted(set(vars(expected)) | set(vars(actual))):
             if name in manually_verified:
                 continue
@@ -146,6 +150,8 @@ class TestModelBuilderReplicate(unittest.TestCase):
             for field in ("indices", "pos_indices", "controller_args", "delay_args", "clamping_args"):
                 self.assertEqual(getattr(expected_entry, field), getattr(actual_entry, field))
 
+
+class TestModelBuilderReplicate(BuilderMergeTestCase):
     def test_replicate_matches_add_world_loop(self):
         world_count = 4
         for use_coord_layout_targets in (False, True):

@@ -13,6 +13,7 @@ import warnings
 from collections import Counter, deque
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
+from itertools import chain
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import numpy as np
@@ -299,6 +300,11 @@ class ModelBuilder:
         "muscle_bodies": Model.AttributeSpec("muscle_point", references=Model.AttributeFrequency.BODY),
         "muscle_points": Model.AttributeSpec("muscle_point"),
         "world_gravity": Model.AttributeSpec(Model.AttributeFrequency.WORLD, compaction_policy="passthrough"),
+        # Clone provenance is construction metadata owned solely by the destination
+        # builder; it is never copied from source builders during a merge.
+        "prototype_label": Model.AttributeSpec(Model.AttributeFrequency.ONCE, compaction_policy="passthrough"),
+        "clone_prototype": Model.AttributeSpec(Model.AttributeFrequency.ONCE, compaction_policy="passthrough"),
+        "clone_label": Model.AttributeSpec(Model.AttributeFrequency.ONCE, compaction_policy="passthrough"),
         "_equality_constraint_world_start": Model.AttributeSpec(
             Model.AttributeFrequency.WORLD,
             compaction_policy="passthrough",
@@ -331,6 +337,12 @@ class ModelBuilder:
             "tet_end": Model.AttributeFrequency.TETRAHEDRON,
         },
     }
+
+    # Canonical clone-provenance domain table: every built-in indexed domain in the
+    # merge offset map (all attribute frequencies with per-builder counts except WORLD).
+    _CLONE_PROVENANCE_FREQUENCIES: ClassVar[tuple[Model.AttributeFrequency, ...]] = tuple(
+        frequency for frequency in Model._ATTRIBUTE_FREQUENCY_COUNT_ATTRS if frequency != Model.AttributeFrequency.WORLD
+    )
 
     # Lazy snapshots of a plain ModelBuilder's attribute names; see _base_builder_attributes().
     _BASE_ATTRIBUTES: ClassVar[frozenset[str] | None] = None
@@ -1492,6 +1504,25 @@ class ModelBuilder:
         """Per-world gravity vectors [m/s^2] retained until :meth:`finalize <ModelBuilder.finalize>` populates
         :attr:`Model.gravity`."""
 
+        # Clone provenance recorded by clone_builders(); public but read-only by
+        # convention, and never transferred to the finalized Model.
+        self.prototype_label: list[str] = []
+        """Prototype labels recorded by :meth:`clone_builders`, indexed by prototype ID."""
+        self.prototype_counts: dict[Model.AttributeFrequency, list[int]] = {
+            frequency: [] for frequency in self._CLONE_PROVENANCE_FREQUENCIES
+        }
+        """Per-prototype entity counts recorded by :meth:`clone_builders`, one list per recorded frequency,
+        indexed by prototype ID."""
+        self.clone_prototype: list[int] = []
+        """Prototype ID of each clone recorded by :meth:`clone_builders`, indexed by clone ID."""
+        self.clone_label: list[str] = []
+        """Resolved label of each clone recorded by :meth:`clone_builders`, indexed by clone ID."""
+        self.clone_starts: dict[Model.AttributeFrequency, list[int]] = {
+            frequency: [] for frequency in self._CLONE_PROVENANCE_FREQUENCIES
+        }
+        """Per-clone destination start indices recorded by :meth:`clone_builders`, one list per recorded
+        frequency, indexed by clone ID."""
+
         self.rigid_gap: float = 0.1
         """Default rigid contact gap [m] applied when adding a shape whose
         ``ModelBuilder.ShapeConfig.gap`` is ``None``. The resolved per-shape values are later
@@ -2649,38 +2680,88 @@ class ModelBuilder:
         xforms: Sequence[Transform | None],
         label_prefixes: Sequence[str | None],
     ) -> None:
-        if builder.up_axis != self.up_axis:
-            raise ValueError("Cannot add a builder with a different up axis.")
+        self._merge_builder_occurrences([builder], [0] * len(worlds), worlds, xforms, label_prefixes)
 
-        world_count = len(worlds)
-        if len(xforms) != world_count or len(label_prefixes) != world_count:
-            raise ValueError("worlds, xforms, and label_prefixes must have the same length")
+    def _merge_builder_occurrences(
+        self,
+        builders: Sequence[ModelBuilder],
+        occurrence_slots: Sequence[int],
+        worlds: Sequence[int],
+        xforms: Sequence[Transform | None],
+        label_prefixes: Sequence[str | None],
+    ) -> dict[str, np.ndarray]:
+        """Merge copies of ``builders`` into this builder, one copy per occurrence.
 
+        ``occurrence_slots`` selects the source builder of each occurrence; ``worlds``,
+        ``xforms``, and ``label_prefixes`` supply its destination world, transform, and
+        label prefix. Occurrences are appended in the given order, matching the
+        equivalent sequence of :meth:`add_builder` calls. Returns the per-occurrence
+        destination start indices for each entity kind in the merge offset map.
+        """
+        for builder in builders:
+            if builder.up_axis != self.up_axis:
+                raise ValueError("Cannot add a builder with a different up axis.")
+
+        occurrence_count = len(occurrence_slots)
+        if (
+            len(worlds) != occurrence_count
+            or len(xforms) != occurrence_count
+            or len(label_prefixes) != occurrence_count
+        ):
+            raise ValueError("occurrence_slots, worlds, xforms, and label_prefixes must have the same length")
+
+        counts_by_slot = [self._builder_merge_counts(builder) for builder in builders]
+        bases = self._builder_merge_counts(self)
+        bases["muscle_point"] = len(self.muscle_bodies)
+        if occurrence_count == 0:
+            return {kind: np.empty(0, dtype=np.int64) for kind in bases}
+
+        slots = [int(slot) for slot in occurrence_slots]
         worlds = np.asarray(worlds, dtype=np.int64)
         identity_transform = np.asarray(wp.transform_identity(), dtype=np.float32)
 
-        def normalize_xform(xform: Transform | None) -> wp.transform | None:
+        def normalize_xform(xform: Transform | None) -> tuple[wp.transform | None, np.ndarray | None]:
             if xform is None:
-                return None
+                return None, None
             xform = wp.transform(*xform)
-            # Identity behaves as None: skips the per-world transform loops and keeps copies
+            row = np.asarray(xform, dtype=np.float32)
+            # Identity behaves as None: skips the per-occurrence transform work and keeps copies
             # bit-exact (identity transform_mul round-trips are not exact for free-root joint_q).
-            return None if np.array_equal(np.asarray(xform), identity_transform) else xform
+            return (None, None) if np.array_equal(row, identity_transform) else (xform, row)
 
-        xforms = [normalize_xform(xform) for xform in xforms]
-        offsets = np.asarray(
-            [np.zeros(3, dtype=np.float32) if xform is None else xform.p for xform in xforms], dtype=np.float32
-        )
+        normalized = [normalize_xform(xform) for xform in xforms]
+        xforms = [xform for xform, _ in normalized]
+        # Rows for identity/None occurrences stay at the identity transform.
+        xform_rows = np.tile(identity_transform, (occurrence_count, 1))
+        for occurrence, (_, row) in enumerate(normalized):
+            if row is not None:
+                xform_rows[occurrence] = row
+        offsets = xform_rows[:, :3]
         identity_rotation = np.asarray(wp.quat_identity(), dtype=np.float32)
-        translations_only = all(
-            xform is None or np.array_equal(np.asarray(xform.q), identity_rotation) for xform in xforms
-        )
+        translations_only = bool((xform_rows[:, 3:] == identity_rotation).all())
 
-        def source_list(attr: str) -> list:
+        # Occurrences typically repeat few (prototype, transform) pairs, so
+        # transform-dependent chunks are computed once per pair and reused.
+        # Reused chunk entries follow the documented shallow-copy semantics.
+        occurrence_keys = [
+            (slot, None if row is None else row.tobytes()) for slot, (_, row) in zip(slots, normalized, strict=True)
+        ]
+
+        def source_list(builder: ModelBuilder, attr: str) -> list:
             values = getattr(builder, attr)
             # Tolerate array-valued fields assigned in place of lists (list-repeat and
             # extend would silently misbehave on ndarrays).
             return values if isinstance(values, list) else list(values)
+
+        def occurrence_sources(attr: str) -> list[list]:
+            return [source_list(builder, attr) for builder in builders]
+
+        def concat_occurrences(sources: list[list]) -> list:
+            if len(builders) == 1:
+                return sources[0] * occurrence_count
+            # C-level pointer copies; the chunks are object lists, so numpy would
+            # pay per-element conversions that cost more than extending references.
+            return list(chain.from_iterable(map(sources.__getitem__, slots)))
 
         transform_mul_cfunc = wp._src.context.runtime.core.wp_builtin_mul_transformf_transformf
 
@@ -2689,64 +2770,100 @@ class ModelBuilder:
             transform_mul_cfunc(a, b, ctypes.byref(out))
             return out
 
-        counts = self._builder_merge_counts(builder)
-        self._validate_builder_merge(builder, set(counts))
+        self._validate_builder_merge_sources(builders, slots, counts_by_slot)
         attribute_specs = self._builder_merge_attribute_specs()
-        bases = self._builder_merge_counts(self)
 
-        start_arrays = {
-            kind: base + np.arange(world_count, dtype=np.int64) * counts[kind] for kind, base in bases.items()
+        def exclusive_cumsum(values: np.ndarray) -> np.ndarray:
+            result = np.zeros(len(values), dtype=np.int64)
+            np.cumsum(values[:-1], out=result[1:])
+            return result
+
+        occurrence_counts = {
+            kind: np.asarray([counts_by_slot[slot][kind] for slot in slots], dtype=np.int64)
+            for kind in bases
+            if kind != "muscle_point"
         }
-        start_arrays["muscle_point"] = len(self.muscle_bodies) + np.arange(world_count, dtype=np.int64) * len(
-            builder.muscle_bodies
+        occurrence_counts["muscle_point"] = np.asarray(
+            [len(builders[slot].muscle_bodies) for slot in slots], dtype=np.int64
         )
+        start_arrays = {kind: base + exclusive_cumsum(occurrence_counts[kind]) for kind, base in bases.items()}
 
         def starts(kind: str) -> np.ndarray:
             return start_arrays[kind]
 
-        def extend_referenced(dst: list, values: Sequence[Any], kind: str) -> None:
-            if not values:
+        def extend_referenced(dst: list, sources: list[list], kind: str) -> None:
+            arrays = [np.asarray(values, dtype=np.int64) for values in sources]
+            lengths = np.asarray([len(arrays[slot]) for slot in slots], dtype=np.int64)
+            total = int(lengths.sum())
+            if total == 0:
                 return
-            source = np.asarray(values, dtype=np.int64)
-            tiled = np.tile(source, (world_count,) + (1,) * (source.ndim - 1))
-            offset_shape = (world_count * len(source),) + (1,) * (source.ndim - 1)
-            offsets = np.repeat(starts(kind), len(source)).reshape(offset_shape)
-            translated = np.where(tiled >= 0, tiled + offsets, tiled)
+            if len(builders) == 1:
+                tiled = np.tile(arrays[0], (occurrence_count,) + (1,) * (arrays[0].ndim - 1))
+            else:
+                tiled = np.concatenate([arrays[slot] for slot in slots if len(arrays[slot])])
+            offset_shape = (total,) + (1,) * (tiled.ndim - 1)
+            occurrence_offsets = np.repeat(starts(kind), lengths).reshape(offset_shape)
+            translated = np.where(tiled >= 0, tiled + occurrence_offsets, tiled)
             dst.extend(translated.tolist())
 
-        self._requested_contact_attributes.update(builder._requested_contact_attributes)
-        self._requested_state_attributes.update(builder._requested_state_attributes)
+        # Only sources with occurrences contribute, matching the sequential expansion;
+        # unreferenced slots register prototypes without merging any state.
+        for slot in set(slots):
+            self._requested_contact_attributes.update(builders[slot]._requested_contact_attributes)
+            self._requested_state_attributes.update(builders[slot]._requested_state_attributes)
 
         attribute_specs.pop("particle_q")
-        if counts["particle"]:
-            self.particle_max_velocity = builder.particle_max_velocity
-            particle_q = np.tile(np.asarray(builder.particle_q, dtype=np.float32), (world_count, 1))
-            particle_q += np.repeat(offsets, counts["particle"], axis=0)
+        particle_counts = occurrence_counts["particle"]
+        if particle_counts.sum():
+            for slot in slots:
+                # The last particle-bearing source wins, matching sequential add_builder.
+                if counts_by_slot[slot]["particle"]:
+                    self.particle_max_velocity = builders[slot].particle_max_velocity
+            particle_q = np.concatenate(
+                [np.asarray(builders[slot].particle_q, dtype=np.float32).reshape((-1, 3)) for slot in slots]
+            )
+            particle_q += np.repeat(offsets, particle_counts, axis=0)
             self.particle_q.extend(particle_q.tolist())
 
         shape_starts = starts("shape")
         body_starts = starts("body")
 
-        attribute_specs.pop("shape_transform")
-        shape_transform_start = len(self.shape_transform)
-        self.shape_transform.extend(source_list("shape_transform") * world_count)
-        if counts["shape"]:
-            static_shapes = np.flatnonzero(np.asarray(builder.shape_body, dtype=np.int64) == -1)
-            for world_index, xform in enumerate(xforms):
-                if xform is None:
-                    continue
-                for shape in static_shapes.tolist():
-                    source = builder.shape_transform[shape]
-                    target = shape_transform_start + world_index * counts["shape"] + shape
-                    self.shape_transform[target] = transform_mul(xform, source)
+        def chunked_by_occurrence(compute: Callable[[int], Any]) -> list:
+            chunks: dict[tuple[int, bytes | None], Any] = {}
+            out = []
+            for occurrence, key in enumerate(occurrence_keys):
+                if key not in chunks:
+                    chunks[key] = compute(occurrence)
+                out.append(chunks[key])
+            return out
 
-        for body_start, shape_start in zip(body_starts, shape_starts, strict=True):
-            for body, shapes in builder.body_shapes.items():
-                translated_shapes = [shape + int(shape_start) for shape in shapes]
+        attribute_specs.pop("shape_transform")
+        static_shapes_by_slot = [
+            np.flatnonzero(np.asarray(builder.shape_body, dtype=np.int64) == -1) for builder in builders
+        ]
+
+        def shape_transform_chunk(occurrence: int) -> list:
+            slot, xform = slots[occurrence], xforms[occurrence]
+            source = source_list(builders[slot], "shape_transform")
+            static_shapes = static_shapes_by_slot[slot]
+            if xform is None or not len(static_shapes):
+                return source
+            chunk = list(source)
+            for shape in static_shapes.tolist():
+                chunk[shape] = transform_mul(xform, source[shape])
+            return chunk
+
+        self.shape_transform.extend(chain.from_iterable(chunked_by_occurrence(shape_transform_chunk)))
+
+        for occurrence, slot in enumerate(slots):
+            body_start = int(body_starts[occurrence])
+            shape_start = int(shape_starts[occurrence])
+            for body, shapes in builders[slot].body_shapes.items():
+                translated_shapes = [shape + shape_start for shape in shapes]
                 if body == -1:
                     self.body_shapes[-1].extend(translated_shapes)
                 else:
-                    self.body_shapes[body + int(body_start)] = translated_shapes
+                    self.body_shapes[body + body_start] = translated_shapes
 
         joint_starts = starts("joint")
         joint_coord_starts = starts("joint_coord")
@@ -2754,76 +2871,112 @@ class ModelBuilder:
 
         attribute_specs.pop("joint_X_p")
         attribute_specs.pop("joint_q")
-        joint_X_p_start = len(self.joint_X_p)
-        self.joint_X_p.extend(source_list("joint_X_p") * world_count)
-        joint_q = np.tile(np.asarray(builder.joint_q, dtype=np.float32), world_count)
-        if counts["joint"]:
+        joint_q_by_slot = [np.asarray(builder.joint_q, dtype=np.float32) for builder in builders]
+        joint_parent_by_slot = [np.asarray(builder.joint_parent, dtype=np.int64) for builder in builders]
+        joint_child_by_slot = [np.asarray(builder.joint_child, dtype=np.int64) for builder in builders]
+        nonfree_roots_by_slot = []
+        free_roots_by_slot = []
+        for slot, builder in enumerate(builders):
             joint_types = np.asarray(builder.joint_type, dtype=np.int64)
-            joint_parents = np.asarray(builder.joint_parent, dtype=np.int64)
-            nonfree_roots = np.flatnonzero((joint_parents == -1) & (joint_types != int(JointType.FREE)))
-            for world_index, xform in enumerate(xforms):
-                if xform is None:
-                    continue
-                for joint in nonfree_roots.tolist():
-                    source = builder.joint_X_p[joint]
-                    target = joint_X_p_start + world_index * counts["joint"] + joint
-                    self.joint_X_p[target] = transform_mul(xform, source)
+            roots = joint_parent_by_slot[slot] == -1
+            nonfree_roots_by_slot.append(np.flatnonzero(roots & (joint_types != int(JointType.FREE))))
+            free_roots_by_slot.append(np.flatnonzero(roots & (joint_types == int(JointType.FREE))))
 
-            free_roots = np.flatnonzero((joint_parents == -1) & (joint_types == int(JointType.FREE)))
-            for world_index, xform in enumerate(xforms):
-                if xform is None:
-                    continue
-                coord_base = world_index * counts["joint_coord"]
-                for joint in free_roots.tolist():
-                    source_q = builder.joint_q_start[joint]
-                    xform_prev = wp.transform(*builder.joint_q[source_q : source_q + 7])
-                    X_pj = builder.joint_X_p[joint]
-                    xform_local = transform_mul(transform_mul(wp.transform_inverse(X_pj), xform), X_pj)
-                    transformed = transform_mul(xform_local, xform_prev)
-                    target_q = coord_base + source_q
-                    joint_q[target_q : target_q + 7] = np.asarray(transformed, dtype=np.float32)
+        def joint_X_p_chunk(occurrence: int) -> list:
+            slot, xform = slots[occurrence], xforms[occurrence]
+            source = source_list(builders[slot], "joint_X_p")
+            nonfree_roots = nonfree_roots_by_slot[slot]
+            if xform is None or not len(nonfree_roots):
+                return source
+            chunk = list(source)
+            for joint in nonfree_roots.tolist():
+                chunk[joint] = transform_mul(xform, source[joint])
+            return chunk
 
-        self.joint_q.extend(joint_q.tolist())
+        self.joint_X_p.extend(chain.from_iterable(chunked_by_occurrence(joint_X_p_chunk)))
 
-        for world_index, joint_start in enumerate(joint_starts.tolist()):
-            body_start = int(body_starts[world_index])
+        def joint_q_chunk(occurrence: int) -> np.ndarray:
+            slot, xform = slots[occurrence], xforms[occurrence]
+            free_roots = free_roots_by_slot[slot]
+            if xform is None or not len(free_roots):
+                return joint_q_by_slot[slot]
+            builder = builders[slot]
+            chunk = joint_q_by_slot[slot].copy()
+            for joint in free_roots.tolist():
+                source_q = builder.joint_q_start[joint]
+                xform_prev = wp.transform(*builder.joint_q[source_q : source_q + 7])
+                X_pj = builder.joint_X_p[joint]
+                xform_local = transform_mul(transform_mul(wp.transform_inverse(X_pj), xform), X_pj)
+                transformed = transform_mul(xform_local, xform_prev)
+                chunk[source_q : source_q + 7] = np.asarray(transformed, dtype=np.float32)
+            return chunk
+
+        self.joint_q.extend(np.concatenate(chunked_by_occurrence(joint_q_chunk)).tolist())
+
+        if occurrence_counts["joint"].sum():
+            for builder in builders:
+                if len(builder.joint_parent) != len(builder.joint_child):
+                    raise ValueError("joint_parent and joint_child must have the same length")
+            # New joints occupy one contiguous destination range, so their IDs are
+            # consecutive from the first occurrence's start; the body-index shifts
+            # vectorize, leaving one flat pass to build the topology maps.
+            body_shifts = np.repeat(body_starts, occurrence_counts["joint"])
+            tiled_parents = np.concatenate([joint_parent_by_slot[slot] for slot in slots])
+            tiled_children = np.concatenate([joint_child_by_slot[slot] for slot in slots])
+            new_parents = np.where(tiled_parents != -1, tiled_parents + body_shifts, tiled_parents)
+            new_children = tiled_children + body_shifts
+            joint_parents = self.joint_parents
+            joint_children = self.joint_children
             for joint, (parent, child) in enumerate(
-                zip(builder.joint_parent, builder.joint_child, strict=True), start=int(joint_start)
+                zip(new_parents.tolist(), new_children.tolist(), strict=True), start=int(joint_starts[0])
             ):
-                new_parent = parent + body_start if parent != -1 else -1
-                new_child = child + body_start
-                self.joint_parents.setdefault(new_child, []).append((new_parent, joint))
-                self.joint_children.setdefault(new_parent, []).append((new_child, joint))
+                joint_parents.setdefault(child, []).append((parent, joint))
+                joint_children.setdefault(parent, []).append((child, joint))
 
         attribute_specs.pop("body_q")
-        if counts["body"]:
+        body_counts = occurrence_counts["body"]
+        if body_counts.sum():
+            body_q_by_slot = [np.asarray(builder.body_q, dtype=np.float32).reshape((-1, 7)) for builder in builders]
             if translations_only:
-                body_q = np.tile(np.asarray(builder.body_q, dtype=np.float32).reshape((-1, 7)), (world_count, 1))
+                body_q = np.concatenate([body_q_by_slot[slot] for slot in slots])
                 if np.any(offsets):
-                    body_q[:, :3] += np.repeat(offsets, counts["body"], axis=0)
+                    body_q[:, :3] += np.repeat(offsets, body_counts, axis=0)
                 # Own each transform without retaining per-row views into the tiled array.
                 self.body_q.extend(wp.transform.from_buffer_copy(row) for row in body_q)
             else:
-                for xform in xforms:
-                    if xform is None:
-                        self.body_q.extend(wp.transform(*body_q) for body_q in builder.body_q)
-                    else:
-                        self.body_q.extend(transform_mul(xform, body_q) for body_q in builder.body_q)
 
-        source_filter_pairs = builder._shape_collision_filter_pairs
-        if source_filter_pairs:
-            template_pairs = (
+                def body_q_chunk(occurrence: int) -> np.ndarray:
+                    slot, xform = slots[occurrence], xforms[occurrence]
+                    if xform is None:
+                        return body_q_by_slot[slot]
+                    rows = [transform_mul(xform, body_q) for body_q in builders[slot].body_q]
+                    return np.asarray(rows, dtype=np.float32).reshape((-1, 7))
+
+                for chunk in chunked_by_occurrence(body_q_chunk):
+                    # Copy rows so every occurrence owns its transforms.
+                    self.body_q.extend(wp.transform.from_buffer_copy(row) for row in chunk)
+
+        template_pairs_by_slot = []
+        for builder in builders:
+            source_filter_pairs = builder._shape_collision_filter_pairs
+            template_pairs_by_slot.append(
                 source_filter_pairs.template_pairs()
                 if isinstance(source_filter_pairs, _BuilderShapeCollisionFilterPairs)
                 else tuple(source_filter_pairs)
             )
-            for world, shape_start in zip(worlds.tolist(), shape_starts.tolist(), strict=True):
+        if any(template_pairs_by_slot):
+            for occurrence, slot in enumerate(slots):
+                template_pairs = template_pairs_by_slot[slot]
+                if not template_pairs:
+                    continue
+                world = int(worlds[occurrence])
+                shape_start = int(shape_starts[occurrence])
                 if isinstance(self._shape_collision_filter_pairs, _BuilderShapeCollisionFilterPairs):
                     self._shape_collision_filter_pairs.extend_offset(
                         template_pairs,
                         shape_start,
                         world=world if world >= 0 else None,
-                        shape_count=builder.shape_count,
+                        shape_count=builders[slot].shape_count,
                     )
                 else:
                     self._shape_collision_filter_pairs.extend(
@@ -2831,42 +2984,60 @@ class ModelBuilder:
                     )
 
         for attr, spec in attribute_specs.items():
-            source = source_list(attr)
-            destination = getattr(self, attr)
             if spec.compaction_policy in {"world_start", "passthrough"}:
                 continue
+            sources = occurrence_sources(attr)
+            destination = getattr(self, attr)
             if spec.compaction_policy == "color_groups":
                 kind = self._builder_frequency_key(spec.frequency)
-                for start in starts(kind).tolist():
-                    translated = [group + start for group in source]
+                kind_starts = starts(kind)
+                for occurrence, slot in enumerate(slots):
+                    start = int(kind_starts[occurrence])
+                    translated = [group + start for group in sources[slot]]
                     destination = combine_independent_particle_coloring(destination, translated)
                 setattr(self, attr, destination)
             elif attr.endswith("_label"):
-                for label_prefix in label_prefixes:
-                    if label_prefix:
-                        destination.extend(f"{label_prefix}/{label}" if label else label for label in source)
-                    else:
-                        destination.extend(source)
+                # Occurrences typically repeat few (slot, prefix) pairs; prefix each pair once.
+                prefixed_labels: dict[tuple[int, str], list[str]] = {}
+                chunks = []
+                for occurrence, slot in enumerate(slots):
+                    label_prefix = label_prefixes[occurrence]
+                    if not label_prefix:
+                        chunks.append(sources[slot])
+                        continue
+                    chunk = prefixed_labels.get((slot, label_prefix))
+                    if chunk is None:
+                        chunk = [f"{label_prefix}/{label}" if label else label for label in sources[slot]]
+                        prefixed_labels[(slot, label_prefix)] = chunk
+                    chunks.append(chunk)
+                destination.extend(chain.from_iterable(chunks))
             elif spec.references in {Model.AttributeFrequency.WORLD, "world"}:
-                source_count = counts.get(self._builder_frequency_key(spec.frequency), len(source))
-                destination.extend(np.repeat(worlds, source_count).tolist())
+                kind = self._builder_frequency_key(spec.frequency)
+                source_counts = occurrence_counts.get(kind)
+                if source_counts is None:
+                    source_counts = np.asarray([len(sources[slot]) for slot in slots], dtype=np.int64)
+                destination.extend(np.repeat(worlds, source_counts).tolist())
             elif spec.references is not None:
-                extend_referenced(destination, source, self._builder_frequency_key(spec.references))
+                extend_referenced(destination, sources, self._builder_frequency_key(spec.references))
             else:
-                destination.extend(source * world_count)
+                destination.extend(concat_occurrences(sources))
 
-        self.joint_dof_count += world_count * counts["joint_dof"]
-        self.joint_coord_count += world_count * counts["joint_coord"]
-        self.joint_constraint_count += world_count * counts["joint_constraint"]
+        self.joint_dof_count += int(occurrence_counts["joint_dof"].sum())
+        self.joint_coord_count += int(occurrence_counts["joint_coord"].sum())
+        self.joint_constraint_count += int(occurrence_counts["joint_constraint"].sum())
 
-        for world_index, world in enumerate(worlds.tolist()):
-            entity_offsets = {kind: int(starts(kind)[world_index]) for kind in counts}
-            self._merge_builder_custom_attributes(builder, entity_offsets, world, label_prefixes[world_index])
-            self._merge_builder_actuators(
-                builder,
-                int(joint_dof_starts[world_index]),
-                int(joint_coord_starts[world_index]),
+        for occurrence, slot in enumerate(slots):
+            entity_offsets = {kind: int(starts(kind)[occurrence]) for kind in counts_by_slot[slot]}
+            self._merge_builder_custom_attributes(
+                builders[slot], entity_offsets, int(worlds[occurrence]), label_prefixes[occurrence]
             )
+            self._merge_builder_actuators(
+                builders[slot],
+                int(joint_dof_starts[occurrence]),
+                int(joint_coord_starts[occurrence]),
+            )
+
+        return start_arrays
 
     @staticmethod
     def _builder_frequency_key(frequency: Model.AttributeFrequency | str) -> str:
@@ -2952,6 +3123,23 @@ class ModelBuilder:
         return isinstance(value, (int, np.integer)) or wp.types.type_is_int(type(value))
 
     @staticmethod
+    def _offset_reference_value(value: Any, offset: int) -> Any:
+        """Translate an entity-referencing custom value by ``offset``, preserving negative sentinels."""
+        if offset == 0:
+            return value
+        if ModelBuilder._is_integer_scalar(value):
+            return value + offset if value >= 0 else value
+        if isinstance(value, (list, tuple)):
+            transformed = [
+                item + offset if ModelBuilder._is_integer_scalar(item) and item >= 0 else item for item in value
+            ]
+            return type(value)(transformed)
+        try:
+            return value + offset
+        except TypeError:
+            return value
+
+    @staticmethod
     def _custom_attribute_defaults_match(existing: Any, incoming: Any) -> bool:
         try:
             matches = existing == incoming
@@ -2961,16 +3149,72 @@ class ModelBuilder:
             return False
         return bool(matches)
 
-    def _validate_builder_merge(self, builder: ModelBuilder, entity_kinds: set[str]) -> None:
-        valid_references = entity_kinds | set(self._custom_frequency_counts) | set(builder._custom_frequency_counts)
+    def _validate_builder_merge_sources(
+        self,
+        builders: Sequence[ModelBuilder],
+        slots: Sequence[int],
+        counts_by_slot: Sequence[dict[str, int]],
+    ) -> None:
+        """Validate each distinct source in first-occurrence order.
+
+        Each source is checked against the destination plus the previously validated
+        sources so that cross-source incompatibilities raise exactly as they would in
+        the equivalent sequential merge.
+        """
+        merged_attributes = dict(self.custom_attributes)
+        merged_frequencies = dict(self.custom_frequencies)
+        merged_finalizers = dict(self._custom_attribute_model_finalizers)
+        merged_frequency_keys = set(self._custom_frequency_counts)
+        validated = set()
+        for slot in slots:
+            if slot in validated:
+                continue
+            validated.add(slot)
+            builder = builders[slot]
+            self._validate_builder_merge(
+                builder,
+                set(counts_by_slot[slot]),
+                merged_attributes=merged_attributes,
+                merged_frequencies=merged_frequencies,
+                merged_finalizers=merged_finalizers,
+                merged_frequency_keys=merged_frequency_keys,
+            )
+            for full_key, attr in builder.custom_attributes.items():
+                merged_attributes.setdefault(full_key, attr)
+            for freq_key, frequency in builder.custom_frequencies.items():
+                merged_frequencies.setdefault(freq_key, frequency)
+            for key, finalizer in builder._custom_attribute_model_finalizers.items():
+                merged_finalizers.setdefault(key, finalizer)
+            merged_frequency_keys.update(builder._custom_frequency_counts)
+
+    def _validate_builder_merge(
+        self,
+        builder: ModelBuilder,
+        entity_kinds: set[str],
+        *,
+        merged_attributes: dict[str, ModelBuilder.CustomAttribute] | None = None,
+        merged_frequencies: dict[str, ModelBuilder.CustomFrequency] | None = None,
+        merged_finalizers: dict[str, Callable] | None = None,
+        merged_frequency_keys: set[str] | None = None,
+    ) -> None:
+        if merged_attributes is None:
+            merged_attributes = self.custom_attributes
+        if merged_frequencies is None:
+            merged_frequencies = self.custom_frequencies
+        if merged_finalizers is None:
+            merged_finalizers = self._custom_attribute_model_finalizers
+        if merged_frequency_keys is None:
+            merged_frequency_keys = set(self._custom_frequency_counts)
+
+        valid_references = entity_kinds | merged_frequency_keys | set(builder._custom_frequency_counts)
 
         for freq_key, frequency in builder.custom_frequencies.items():
-            existing = self.custom_frequencies.get(freq_key)
+            existing = merged_frequencies.get(freq_key)
             if existing is not None and not self._custom_frequency_specs_match(existing, frequency):
                 raise ValueError(f"Custom frequency '{freq_key}' is already registered with different callbacks.")
 
         for full_key, attr in builder.custom_attributes.items():
-            merged = self.custom_attributes.get(full_key)
+            merged = merged_attributes.get(full_key)
             if merged is not None:
                 if not self._custom_attribute_specs_match(merged, attr):
                     raise ValueError(f"Custom attribute '{full_key}' already exists with incompatible spec")
@@ -3003,7 +3247,7 @@ class ModelBuilder:
                     )
 
         for key, finalizer in builder._custom_attribute_model_finalizers.items():
-            existing = self._custom_attribute_model_finalizers.get(key)
+            existing = merged_finalizers.get(key)
             if existing is not None and existing is not finalizer:
                 raise ValueError(
                     f"Custom attribute finalizer '{key}' is already registered with a different callback "
@@ -3930,6 +4174,349 @@ class ModelBuilder:
             raise
         self.end_world()
 
+    @dataclass
+    class _ClonePlan:
+        """Validated clone schedule shared by the clone_builders() executors."""
+
+        builders: list[ModelBuilder]
+        prototype_labels: list[str]
+        counts_by_slot: list[dict[str, int]]
+        rows: list[list[int]]
+        occurrence_slots: list[int]
+        occurrence_worlds: list[int]
+        occurrence_xforms: list[Transform | None]
+        occurrence_labels: list[str]
+
+    def clone_builders(
+        self,
+        builders: list[ModelBuilder],
+        world_builders: list[list[int]],
+        *,
+        world_xforms: list[list[Transform]] | None = None,
+        world_prefixes: list[str] | None = None,
+        prototype_labels: list[str] | None = None,
+        clone_prefixes: list[list[str]] | None = None,
+    ) -> None:
+        """Construct heterogeneous worlds by cloning source builders according to a clone plan.
+
+        Each row of ``world_builders`` creates one destination world, and the source
+        builders (*prototypes*) it references are added to that world in the listed
+        order. For supported inputs this is equivalent to expanding each row as
+        ``begin_world(); add_builder(...)*; end_world()`` with the corresponding
+        transforms and resolved clone labels. In addition, the call records compact
+        construction provenance in :attr:`prototype_label`, :attr:`prototype_counts`,
+        :attr:`clone_prototype`, :attr:`clone_label`, and :attr:`clone_starts`,
+        sufficient to translate prototype-local indices into destination indices after
+        the plan has been applied.
+
+        Every slot in ``builders`` registers a new prototype with a fresh prototype ID,
+        even when the same builder object was passed in an earlier call, and even when
+        the slot is not referenced by ``world_builders``. Each occurrence in the
+        flattened, world-major plan registers one clone. A clone's resolved label joins
+        its world prefix with its clone prefix (or with its prototype label when
+        ``clone_prefixes`` is omitted) using ``/``, and prefixes the labels copied from
+        the source builder following the :meth:`add_builder` rules. Label uniqueness is
+        neither enforced nor assumed.
+
+        This method has stricter preconditions than sequential expansion:
+
+        - The destination must not be inside an open world context and cannot itself
+          appear in ``builders``.
+        - Source builders must have ``world_count == 0`` and must not be empty; empty
+          plan rows and empty ``builders`` or ``world_builders`` are rejected.
+        - Explicitly supplied labels and prefixes must be nonempty, and the optional
+          arguments must match the shape of ``world_builders`` (or of ``builders`` for
+          ``prototype_labels``) with no inner ``None`` values.
+        - Prototypes are logically read-only until the destination is finalized, and
+          clone-produced rows must not be modified or reindexed during that interval.
+          Once clone metadata exists, :meth:`collapse_fixed_joints` raises; collapse
+          fixed joints on the prototypes before cloning instead.
+
+        Only cheap structural validation is performed; callers are responsible for the
+        full contract. If an exception occurs after mutation begins, the destination
+        builder is invalid and must be discarded. The gravity of each destination world
+        follows the :meth:`add_builder` replacement rule (the last builder in the row
+        wins); a warning is emitted when builders composed into one world disagree.
+        Conflicting explicit ``WORLD``/``ONCE`` custom-attribute values likewise warn
+        and retain the sequential last-value-wins behavior.
+
+        Args:
+            builders: Source prototype builders. Each slot registers one prototype.
+            world_builders: One row per destination world, listing indices into
+                ``builders`` in the order the clones are added to that world.
+            world_xforms: Optional per-occurrence :meth:`add_builder` transforms with
+                exactly the same nested shape as ``world_builders``.
+            world_prefixes: Optional per-world label prefixes, one per row.
+            prototype_labels: Optional prototype names, one per entry in ``builders``.
+                When omitted, labels are generated as ``prototype_{id}`` from the
+                globally allocated prototype IDs.
+            clone_prefixes: Optional per-occurrence label prefixes with exactly the
+                same nested shape as ``world_builders``. When omitted, the prototype
+                label is used as the clone prefix.
+
+        Raises:
+            RuntimeError: If called inside an open world context.
+            ValueError: If the plan violates the structural preconditions above.
+
+        Example::
+
+            robot = ModelBuilder()
+            robot.add_body(...)
+            box = ModelBuilder()
+            box.add_body(...)
+
+            scene = ModelBuilder()
+            scene.clone_builders(
+                [robot, box],
+                [[0, 1], [1, 0], [0, 0]],
+                prototype_labels=["robot", "box"],
+            )
+            model = scene.finalize()
+
+            # Translate a prototype-local body index into a model index for each
+            # clone of the "robot" prototype.
+            body_frequency = Model.AttributeFrequency.BODY
+            for clone_id, prototype in enumerate(scene.clone_prototype):
+                if scene.prototype_label[prototype] == "robot":
+                    body = scene.clone_starts[body_frequency][clone_id] + local_body_index
+        """
+        plan = self._prepare_clone_plan(
+            builders, world_builders, world_xforms, world_prefixes, prototype_labels, clone_prefixes
+        )
+        existing_once_values = {
+            full_key: attr.values[0]
+            for full_key, attr in self.custom_attributes.items()
+            if not isinstance(attr.frequency, str)
+            and attr.frequency == Model.AttributeFrequency.ONCE
+            and attr.values
+            and 0 in attr.values
+        }
+        clone_base = len(self.clone_prototype)
+        self._execute_clone_plan_batched(plan)
+        self._warn_clone_plan_value_conflicts(plan, existing_once_values, clone_base)
+
+    def _prepare_clone_plan(
+        self,
+        builders: list[ModelBuilder],
+        world_builders: list[list[int]],
+        world_xforms: list[list[Transform]] | None,
+        world_prefixes: list[str] | None,
+        prototype_labels: list[str] | None,
+        clone_prefixes: list[list[str]] | None,
+    ) -> ModelBuilder._ClonePlan:
+        """Validate a clone plan before any mutation and resolve labels and occurrences."""
+        if self.current_world != -1:
+            raise RuntimeError(
+                f"Cannot clone builders: already in world context (current_world={self.current_world}). "
+                "Call end_world() first to close the current world context."
+            )
+        if len(builders) == 0:
+            raise ValueError("clone_builders() requires at least one source builder.")
+        if any(builder is self for builder in builders):
+            raise ValueError("The destination builder cannot also be a source builder.")
+        for i, builder in enumerate(builders):
+            if builder.world_count != 0:
+                raise ValueError(
+                    f"Source builder {i} has world_count={builder.world_count}; "
+                    "clone_builders() sources must have world_count == 0."
+                )
+        counts_by_slot = [self._builder_merge_counts(builder) for builder in builders]
+        for i, counts in enumerate(counts_by_slot):
+            if not any(counts.values()):
+                raise ValueError(f"Source builder {i} is empty; empty prototypes are unsupported.")
+        if len(world_builders) == 0:
+            raise ValueError("clone_builders() requires at least one row in world_builders.")
+        for r, row in enumerate(world_builders):
+            if len(row) == 0:
+                raise ValueError(f"world_builders[{r}] is empty; every world must contain at least one clone.")
+            for entry in row:
+                if isinstance(entry, bool) or not isinstance(entry, (int, np.integer)):
+                    raise ValueError(f"world_builders[{r}] entries must be int indices into builders, got {entry!r}.")
+                if entry < 0 or entry >= len(builders):
+                    raise ValueError(
+                        f"world_builders[{r}] index {int(entry)} is out of range for {len(builders)} builders."
+                    )
+
+        def check_nested_shape(name: str, nested: Sequence[Sequence[Any]]) -> None:
+            if len(nested) != len(world_builders):
+                raise ValueError(f"{name} must have the same length as world_builders.")
+            for r, (values, row) in enumerate(zip(nested, world_builders, strict=True)):
+                if values is None or len(values) != len(row):
+                    raise ValueError(f"{name}[{r}] must have the same length as world_builders[{r}].")
+
+        if world_xforms is not None:
+            check_nested_shape("world_xforms", world_xforms)
+            for r, row in enumerate(world_xforms):
+                if any(xform is None for xform in row):
+                    raise ValueError(f"world_xforms[{r}] must not contain None entries.")
+        if clone_prefixes is not None:
+            check_nested_shape("clone_prefixes", clone_prefixes)
+            for r, row in enumerate(clone_prefixes):
+                if not all(isinstance(prefix, str) and prefix for prefix in row):
+                    raise ValueError(f"clone_prefixes[{r}] entries must be nonempty strings.")
+        if world_prefixes is not None:
+            if len(world_prefixes) != len(world_builders):
+                raise ValueError("world_prefixes must have the same length as world_builders.")
+            if not all(isinstance(prefix, str) and prefix for prefix in world_prefixes):
+                raise ValueError("world_prefixes entries must be nonempty strings.")
+        if prototype_labels is not None:
+            if len(prototype_labels) != len(builders):
+                raise ValueError("prototype_labels must have the same length as builders.")
+            if not all(isinstance(label, str) and label for label in prototype_labels):
+                raise ValueError("prototype_labels entries must be nonempty strings.")
+            resolved_prototype_labels = list(prototype_labels)
+        else:
+            prototype_base = len(self.prototype_label)
+            resolved_prototype_labels = [f"prototype_{prototype_base + i}" for i in range(len(builders))]
+
+        rows = [[int(slot) for slot in row] for row in world_builders]
+        base_world = self.world_count
+        occurrence_slots: list[int] = []
+        occurrence_worlds: list[int] = []
+        occurrence_xforms: list[Transform | None] = []
+        occurrence_labels: list[str] = []
+        for r, row in enumerate(rows):
+            world_prefix = world_prefixes[r] if world_prefixes is not None else None
+            for k, slot in enumerate(row):
+                clone_prefix = clone_prefixes[r][k] if clone_prefixes is not None else resolved_prototype_labels[slot]
+                occurrence_slots.append(slot)
+                occurrence_worlds.append(base_world + r)
+                occurrence_xforms.append(world_xforms[r][k] if world_xforms is not None else None)
+                occurrence_labels.append("/".join(part for part in (world_prefix, clone_prefix) if part))
+
+        for r, row in enumerate(rows):
+            gravities = {
+                tuple(np.asarray(builders[slot]._gravity_as_vector(), dtype=np.float32).tolist()) for slot in row
+            }
+            if len(gravities) > 1:
+                warnings.warn(
+                    f"clone_builders(): builders composed into world {base_world + r} specify different "
+                    "gravity values; the gravity of the last builder in the row wins.",
+                    stacklevel=3,
+                )
+
+        return ModelBuilder._ClonePlan(
+            builders=list(builders),
+            prototype_labels=resolved_prototype_labels,
+            counts_by_slot=counts_by_slot,
+            rows=rows,
+            occurrence_slots=occurrence_slots,
+            occurrence_worlds=occurrence_worlds,
+            occurrence_xforms=occurrence_xforms,
+            occurrence_labels=occurrence_labels,
+        )
+
+    def _execute_clone_plan_batched(self, plan: ModelBuilder._ClonePlan) -> None:
+        """Apply a validated clone plan in one batched merge pass."""
+        start_arrays = self._merge_builder_occurrences(
+            plan.builders,
+            plan.occurrence_slots,
+            plan.occurrence_worlds,
+            plan.occurrence_xforms,
+            plan.occurrence_labels,
+        )
+        for row in plan.rows:
+            # Matches sequential expansion: each add_builder() replaces the current
+            # world's gravity, so the last builder in the row wins.
+            self.world_gravity.append(plan.builders[row[-1]]._gravity_as_vector())
+        self.world_count += len(plan.rows)
+        self._record_clone_plan_metadata(plan, start_arrays)
+
+    def _execute_clone_plan_sequential(self, plan: ModelBuilder._ClonePlan) -> None:
+        """Sequential reference executor for a validated clone plan.
+
+        Expands the normative ``begin_world(); add_builder(...)*; end_world()`` routine
+        directly and records identical clone metadata from live destination counts.
+        Serves as the conformance oracle for the batched executor.
+        """
+        kinds = [self._builder_frequency_key(frequency) for frequency in self._CLONE_PROVENANCE_FREQUENCIES]
+        occurrence_starts: dict[str, list[int]] = {kind: [] for kind in kinds}
+        occurrence = 0
+        for row in plan.rows:
+            self.begin_world()
+            for _ in row:
+                live_counts = self._builder_merge_counts(self)
+                for kind in kinds:
+                    occurrence_starts[kind].append(live_counts[kind])
+                self.add_builder(
+                    plan.builders[plan.occurrence_slots[occurrence]],
+                    xform=plan.occurrence_xforms[occurrence],
+                    label_prefix=plan.occurrence_labels[occurrence],
+                )
+                occurrence += 1
+            self.end_world()
+        self._record_clone_plan_metadata(plan, occurrence_starts)
+
+    def _record_clone_plan_metadata(
+        self, plan: ModelBuilder._ClonePlan, occurrence_starts: dict[str, Sequence[int] | np.ndarray]
+    ) -> None:
+        """Append prototype and clone provenance for one applied clone plan."""
+        prototype_base = len(self.prototype_label)
+        self.prototype_label.extend(plan.prototype_labels)
+        self.clone_prototype.extend(prototype_base + slot for slot in plan.occurrence_slots)
+        self.clone_label.extend(plan.occurrence_labels)
+        for frequency in self._CLONE_PROVENANCE_FREQUENCIES:
+            kind = self._builder_frequency_key(frequency)
+            self.prototype_counts[frequency].extend(counts[kind] for counts in plan.counts_by_slot)
+            starts = occurrence_starts[kind]
+            self.clone_starts[frequency].extend(starts.tolist() if isinstance(starts, np.ndarray) else starts)
+
+    def _warn_clone_plan_value_conflicts(
+        self, plan: ModelBuilder._ClonePlan, existing_once_values: dict[str, Any], clone_base: int
+    ) -> None:
+        """Warn about conflicting explicit WORLD/ONCE custom values in an applied plan.
+
+        Explicit ``WORLD`` values target the clone's destination world and explicit
+        ``ONCE`` values target destination index zero. The merge itself retains the
+        sequential last-value-wins behavior; this scan only reports disagreements,
+        comparing reference-valued attributes after mapping them into destination
+        indices. Values referencing custom frequencies are not compared.
+        """
+        frequency_by_kind = {
+            self._builder_frequency_key(frequency): frequency for frequency in self._CLONE_PROVENANCE_FREQUENCIES
+        }
+        seen_world_values: dict[tuple[str, int], Any] = {}
+        seen_once_values: dict[str, Any] = dict(existing_once_values)
+        for occurrence, slot in enumerate(plan.occurrence_slots):
+            builder = plan.builders[slot]
+            world = plan.occurrence_worlds[occurrence]
+            for full_key, attr in builder.custom_attributes.items():
+                if isinstance(attr.frequency, str) or not attr.values or 0 not in attr.values:
+                    continue
+                is_once = attr.frequency == Model.AttributeFrequency.ONCE
+                if not is_once and attr.frequency != Model.AttributeFrequency.WORLD:
+                    continue
+                value = attr.values[0]
+                if attr.references == "world":
+                    value = world
+                elif attr.references in frequency_by_kind:
+                    frequency = frequency_by_kind[attr.references]
+                    value = self._offset_reference_value(value, self.clone_starts[frequency][clone_base + occurrence])
+                elif attr.references is not None:
+                    continue
+                if is_once:
+                    if full_key in seen_once_values and not self._custom_attribute_defaults_match(
+                        seen_once_values[full_key], value
+                    ):
+                        warnings.warn(
+                            f"clone_builders(): conflicting explicit ONCE values for custom attribute "
+                            f"'{full_key}' ({seen_once_values[full_key]!r} != {value!r}); the last value wins.",
+                            stacklevel=3,
+                        )
+                    seen_once_values[full_key] = value
+                else:
+                    key = (full_key, world)
+                    if key in seen_world_values and not self._custom_attribute_defaults_match(
+                        seen_world_values[key], value
+                    ):
+                        warnings.warn(
+                            f"clone_builders(): conflicting explicit WORLD values for custom attribute "
+                            f"'{full_key}' in world {world} ({seen_world_values[key]!r} != {value!r}); "
+                            "the last value wins.",
+                            stacklevel=3,
+                        )
+                    seen_world_values[key] = value
+
     # endregion
 
     def _merge_builder_custom_attributes(
@@ -4011,19 +4598,7 @@ class ModelBuilder:
             ) -> Any:
                 if replace_with_world:
                     return world
-                if offset == 0:
-                    return value
-                if self._is_integer_scalar(value):
-                    return value + offset if value >= 0 else value
-                if isinstance(value, (list, tuple)):
-                    transformed = [
-                        item + offset if self._is_integer_scalar(item) and item >= 0 else item for item in value
-                    ]
-                    return type(value)(transformed)
-                try:
-                    return value + offset
-                except TypeError:
-                    return value
+                return self._offset_reference_value(value, offset)
 
             def transform_enum_value(
                 entity_idx: int,
@@ -5335,7 +5910,19 @@ class ModelBuilder:
             verbose: If True, print additional information about the collapsed joints.
             joints_to_keep: An optional sequence of joint labels or original joint indices to be excluded from
                 the collapse process.
+
+        Raises:
+            RuntimeError: If clone metadata recorded by :meth:`clone_builders` exists.
+                Collapsing deletes and reindexes bodies and joints, which would
+                invalidate the recorded provenance; collapse fixed joints on the
+                prototypes before cloning instead.
         """
+        if self.prototype_label or self.clone_prototype:
+            raise RuntimeError(
+                "collapse_fixed_joints() is unsupported once clone metadata recorded by clone_builders() "
+                "exists because it deletes and reindexes bodies and joints. "
+                "Collapse fixed joints on the prototypes before cloning."
+            )
         joints_to_keep = set(joints_to_keep or ())
 
         body_data = {}
