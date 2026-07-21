@@ -240,7 +240,9 @@ def build_sphere_on_plane(
     return _builder
 
 
-def make_setup_solver_kamino(dt: float, max_frames: int, use_box: bool = False) -> SolverSetup:
+def make_setup_solver_kamino(
+    dt: float, max_frames: int, use_box: bool = False, dvi_mode: str | None = None
+) -> SolverSetup:
     builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
     newton.solvers.SolverKamino.register_custom_attributes(builder)
     builder.request_contact_attributes("force")
@@ -257,13 +259,23 @@ def make_setup_solver_kamino(dt: float, max_frames: int, use_box: bool = False) 
     )
     model = builder.finalize(skip_validation_joints=True)
     model.rigid_contact_max = 4
-    solver_config = newton.solvers.SolverKamino.Config.from_model(model)
-    solver_config.padmm.primal_tolerance = 1e-6
-    solver_config.padmm.dual_tolerance = 1e-6
-    solver_config.padmm.compl_tolerance = 1e-6
-    solver_config.padmm.max_iterations = 200
-    solver_config.padmm.rho_0 = 1.0
-    solver_config.padmm.warmstart_mode = "none"
+    if dvi_mode is None:
+        solver_config = newton.solvers.SolverKamino.Config.from_model(model)
+        solver_config.padmm.primal_tolerance = 1e-6
+        solver_config.padmm.dual_tolerance = 1e-6
+        solver_config.padmm.compl_tolerance = 1e-6
+        solver_config.padmm.max_iterations = 200
+        solver_config.padmm.rho_0 = 1.0
+        solver_config.padmm.warmstart_mode = "none"
+    else:
+        solver_config = newton.solvers.SolverKamino.Config.from_model(
+            model,
+            dynamics_solver="dvi",
+            sparse_dynamics=dvi_mode == "sparse",
+        )
+        solver_config.dvi.max_iterations = 200
+        solver_config.dvi.tolerance = 1e-6
+        solver_config.dvi.warmstart_mode = "none"
     solver = newton.solvers.SolverKamino(model=model, config=solver_config)
     # metrics = SolutionMetricsNewton(
     #    dt=dt,
@@ -276,7 +288,7 @@ def make_setup_solver_kamino(dt: float, max_frames: int, use_box: bool = False) 
     #    mode=SolutionMetricsLogger.Mode.ROLLING,
     # )
     setup = SolverSetup(
-        name="kamino",
+        name="kamino" if dvi_mode is None else f"kamino_dvi_{dvi_mode}",
         builder=builder,
         model=model,
         solver=solver,
@@ -445,7 +457,9 @@ class Example:
         self.viewer_forces = True
 
         # Create the solver setups
+        self.dvi_mode = getattr(args, "dvi_mode", "dense")
         self.setup_kamino = make_setup_solver_kamino(self.sim_dt, 5000, use_box=use_box)
+        self.setup_kamino_dvi = make_setup_solver_kamino(self.sim_dt, 5000, use_box=use_box, dvi_mode=self.dvi_mode)
         self.setup_mujoco = make_setup_solver_mujoco(self.sim_dt, 5000, use_box=use_box)
         self.setup_xpbd = make_setup_solver_xpbd(self.sim_dt, 5000, use_box=use_box)
 
@@ -455,8 +469,8 @@ class Example:
         self.body_q_ref = np.load(os.path.join(ref_folder, "body_q_ref_bouncing_ball.npy"))
 
         # Solver setup choice
-        self.setup_names = ["Kamino", "MuJoCo", "XPBD", "Reference"]
-        self.setups = [self.setup_kamino, self.setup_mujoco, self.setup_xpbd, self.setup_kamino]
+        self.setup_names = ["Kamino", f"Kamino_DVI_{self.dvi_mode}", "MuJoCo", "XPBD", "Reference"]
+        self.setups = [self.setup_kamino, self.setup_kamino_dvi, self.setup_mujoco, self.setup_xpbd, self.setup_kamino]
         self.current_setup_id = 0
         self.init_setup(reset_viewer=True, first=True)
 
@@ -619,6 +633,13 @@ if __name__ == "__main__":
         type=bool,
         default=True,
         help="Keep recorded PNG frames after the MP4 has been generated",
+    )
+    parser.add_argument(
+        "--dvi-mode",
+        type=str,
+        choices=["dense", "sparse"],
+        default="dense",
+        help="Execution mode for the Kamino DVI solver setup",
     )
     viewer, args = newton.examples.init(parser)
 

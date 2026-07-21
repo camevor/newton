@@ -118,7 +118,9 @@ def _step_time(
 ###
 
 
-def make_setup_solver_kamino(asset_file: str, dt: float, max_frames: int, alpha: float) -> SolverSetup:
+def make_setup_solver_kamino(
+    asset_file: str, dt: float, max_frames: int, alpha: float, dvi_mode: str | None = None
+) -> SolverSetup:
     robot_builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
     newton.solvers.SolverKamino.register_custom_attributes(robot_builder)
     robot_builder.default_shape_cfg.margin = 0.0
@@ -136,13 +138,23 @@ def make_setup_solver_kamino(asset_file: str, dt: float, max_frames: int, alpha:
     builder.add_world(robot_builder)
     builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(collision_group=-1))
     model = builder.finalize(skip_validation_joints=True)
-    solver_config = newton.solvers.SolverKamino.Config.from_model(model)
-    solver_config.padmm.primal_tolerance = 1e-4
-    solver_config.padmm.dual_tolerance = 1e-4
-    solver_config.padmm.compl_tolerance = 1e-4
-    solver_config.padmm.max_iterations = 200
-    solver_config.padmm.rho_0 = 0.1
-    solver_config.padmm.warmstart_mode = "none"
+    if dvi_mode is None:
+        solver_config = newton.solvers.SolverKamino.Config.from_model(model)
+        solver_config.padmm.primal_tolerance = 1e-4
+        solver_config.padmm.dual_tolerance = 1e-4
+        solver_config.padmm.compl_tolerance = 1e-4
+        solver_config.padmm.max_iterations = 200
+        solver_config.padmm.rho_0 = 0.1
+        solver_config.padmm.warmstart_mode = "none"
+    else:
+        solver_config = newton.solvers.SolverKamino.Config.from_model(
+            model,
+            dynamics_solver="dvi",
+            sparse_dynamics=dvi_mode == "sparse",
+        )
+        solver_config.dvi.max_iterations = 200
+        solver_config.dvi.tolerance = 1e-4
+        solver_config.dvi.warmstart_mode = "none"
     solver_config.constraints.alpha = alpha
     solver = newton.solvers.SolverKamino(model=model, config=solver_config)
     # metrics = SolutionMetricsNewton(
@@ -156,7 +168,7 @@ def make_setup_solver_kamino(asset_file: str, dt: float, max_frames: int, alpha:
     #    mode=SolutionMetricsLogger.Mode.ROLLING,
     # )
     setup = SolverSetup(
-        name="kamino",
+        name="kamino" if dvi_mode is None else f"kamino_dvi_{dvi_mode}",
         builder=builder,
         model=model,
         solver=solver,
@@ -345,8 +357,10 @@ class Example:
         asset_file = os.path.join(assets_dir, "four_bar_articulated.usda")
 
         # Create the solver setups
+        self.dvi_mode = getattr(args, "dvi_mode", "dense")
         self.setup_kamino_soft = make_setup_solver_kamino(asset_file, self.sim_dt, 5000, 0.01)
         self.setup_kamino_stiff = make_setup_solver_kamino(asset_file, self.sim_dt, 5000, 0.1)
+        self.setup_kamino_dvi = make_setup_solver_kamino(asset_file, self.sim_dt, 5000, 0.1, dvi_mode=self.dvi_mode)
         self.setup_mujoco_soft = make_setup_solver_mujoco(asset_file, self.sim_dt, 5000, 0.1)
         self.setup_mujoco_medium = make_setup_solver_mujoco(asset_file, self.sim_dt, 5000, 0.01)
         self.setup_mujoco_stiff = make_setup_solver_mujoco(asset_file, self.sim_dt, 5000, 0.001)
@@ -361,6 +375,7 @@ class Example:
         self.setup_names = [
             "Kamino_soft",
             "Kamino_stiff",
+            f"Kamino_DVI_{self.dvi_mode}",
             "MuJoCo_soft",
             "MuJoCo_medium",
             "MuJoCo_stiff",
@@ -370,6 +385,7 @@ class Example:
         self.setups = [
             self.setup_kamino_soft,
             self.setup_kamino_stiff,
+            self.setup_kamino_dvi,
             self.setup_mujoco_soft,
             self.setup_mujoco_medium,
             self.setup_mujoco_stiff,
@@ -550,6 +566,13 @@ if __name__ == "__main__":
         type=bool,
         default=True,
         help="Keep recorded PNG frames after the MP4 has been generated",
+    )
+    parser.add_argument(
+        "--dvi-mode",
+        type=str,
+        choices=["dense", "sparse"],
+        default="dense",
+        help="Execution mode for the Kamino DVI solver setup",
     )
     viewer, args = newton.examples.init(parser)
 
